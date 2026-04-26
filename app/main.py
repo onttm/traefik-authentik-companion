@@ -7,26 +7,22 @@ For every HTTP router using the configured authentik middleware chain, this serv
   4. Reads the container's authentik.access.group label and binds the named
      group(s) to the application as an access policy
 
+Stale app handling (STALE_ACTION):
+
+  flag (default): when a provisioned host disappears from Traefik, log a WARNING
+    each poll with instructions for manual removal. Nothing is deleted automatically.
+
+  remove: after STALE_THRESHOLD_DAYS of continuous absence, automatically delete
+    the Authentik Application, Provider, and policy bindings, and remove the provider
+    from the outpost. A grace period prevents accidental deletion during routine
+    container restarts or maintenance.
+
 Access group binding modes (AUTHENTIK_GROUP_MODE):
 
-  hierarchical (default, recommended):
-    Label your app with the MINIMUM group that should access it.
-    The companion automatically binds that group AND all higher-privilege
-    groups so they are never accidentally locked out.
+  hierarchical (default): label the minimum required group — higher-privilege tiers
+    are automatically included. homelab-media → binds media + trusted + admin.
 
-      Label: homelab-media  →  binds: homelab-media, homelab-trusted, homelab-admin
-
-    Tier order is defined by the AUTHENTIK_GROUP_* vars (guest → admin).
-    Groups not in the tier list are bound as-is (no upward expansion).
-
-  flat (for Authentik pros only — you have been warned):
-    The companion binds only what you explicitly put in the label.
-    No inference, no safety net. If you label an app homelab-media and
-    forget to list homelab-admin, your admin account cannot access it.
-    Comma-separate for multiple groups: homelab-media,homelab-trusted
-
-No label on a container = open to all authenticated users (Authentik default).
-File-provider routers have no container and get no group binding.
+  flat (for Authentik pros only — you have been warned): bind only what you list.
 
 Future: share Traefik discovery with cf-companion for a unified stack-companion.
 """
@@ -36,6 +32,7 @@ import logging
 import os
 import re
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 from authentik import AuthentikClient
@@ -62,13 +59,14 @@ STATE_FILE           = Path(os.environ.get("STATE_FILE", "/data/provisioned.json
 DOCKER_URL           = os.environ.get("DOCKER_URL", "")
 LABEL_KEY            = os.environ.get("AUTHENTIK_LABEL_KEY", "authentik.access.group")
 GROUP_MODE           = os.environ.get("AUTHENTIK_GROUP_MODE", "hierarchical").lower()
+STALE_ACTION         = os.environ.get("STALE_ACTION", "flag").lower()
+STALE_THRESHOLD_DAYS = int(os.environ.get("STALE_THRESHOLD_DAYS", "30"))
 
 _TOKEN_FILE = os.environ.get("AUTHENTIK_TOKEN_FILE", "/run/secrets/authentik_token")
 _TOKEN_ENV  = os.environ.get("AUTHENTIK_TOKEN", "")
 
 # Tier order: index 0 = lowest privilege, index 3 = highest.
 # In hierarchical mode, labelling an app with tier N automatically binds tiers N..3.
-# Any group name not in this list is bound as-is (custom groups, no expansion).
 _TIER_ORDER: list[str] = [
     g for g in [
         os.environ.get("AUTHENTIK_GROUP_GUEST"),
@@ -78,7 +76,6 @@ _TIER_ORDER: list[str] = [
     ] if g
 ]
 
-# Standard groups to ensure exist in Authentik on startup (all four tiers)
 _STANDARD_GROUPS: list[str] = _TIER_ORDER[:]
 
 _DOMAIN_RE = re.compile(r'^([^.]+)\.(.+)$')
@@ -94,18 +91,33 @@ def _load_token() -> str:
         raise RuntimeError(f"Cannot read Authentik token from {_TOKEN_FILE}: {exc}") from exc
 
 
-def _load_state() -> set:
-    if STATE_FILE.exists():
-        try:
-            return set(json.loads(STATE_FILE.read_text()))
-        except Exception:
-            log.warning("State file corrupt, starting fresh")
-    return set()
+# ── state management ──────────────────────────────────────────────────────────
+
+def _load_state() -> tuple[set, dict]:
+    """Return (provisioned_hosts, stale_since_map).
+
+    Migrates v1 state (plain list) to v2 format automatically.
+    """
+    if not STATE_FILE.exists():
+        return set(), {}
+    try:
+        data = json.loads(STATE_FILE.read_text())
+        if isinstance(data, list):
+            log.info("Migrating state file from v1 to v2 format")
+            return set(data), {}
+        return set(data.get("provisioned", [])), data.get("stale_since", {})
+    except Exception:
+        log.warning("State file corrupt, starting fresh")
+        return set(), {}
 
 
-def _save_state(provisioned: set) -> None:
+def _save_state(provisioned: set, stale_since: dict) -> None:
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    STATE_FILE.write_text(json.dumps(sorted(provisioned), indent=2))
+    STATE_FILE.write_text(json.dumps({
+        "version": 2,
+        "provisioned": sorted(provisioned),
+        "stale_since": stale_since,
+    }, indent=2))
 
 
 def _slug(text: str) -> str:
@@ -113,24 +125,16 @@ def _slug(text: str) -> str:
 
 
 def _resolve_groups(label_value: str) -> list[str]:
-    """Return the list of group names to bind, applying the configured mode.
-
-    hierarchical: expands each labeled group to include all higher-privilege tiers.
-    flat:         returns exactly what is in the label — no expansion.
-    """
+    """Return the list of group names to bind, applying the configured mode."""
     requested = [g.strip() for g in label_value.split(",") if g.strip()]
-
     if GROUP_MODE != "hierarchical" or not _TIER_ORDER:
         return requested
-
     result: set[str] = set()
     for group in requested:
         if group in _TIER_ORDER:
-            idx = _TIER_ORDER.index(group)
-            result.update(_TIER_ORDER[idx:])  # this group + all higher tiers
+            result.update(_TIER_ORDER[_TIER_ORDER.index(group):])
         else:
-            result.add(group)  # custom group — bind as-is
-
+            result.add(group)
     return list(result)
 
 
@@ -143,21 +147,22 @@ def run() -> None:
     docker  = DockerClient(DOCKER_URL) if DOCKER_URL else None
 
     log.info("Starting authentik-companion")
-    log.info("  Traefik:    %s", TRAEFIK_URL)
-    log.info("  Authentik:  %s", AUTHENTIK_URL)
-    log.info("  Outpost:    %s", AUTHENTIK_OUTPOST)
-    log.info("  Middleware: %s", AUTHENTIK_MIDDLEWARE)
-    log.info("  Interval:   %ds", POLL_INTERVAL)
-    log.info("  Docker:     %s", DOCKER_URL or "disabled")
-    log.info("  Label key:  %s", LABEL_KEY)
+    log.info("  Traefik:      %s", TRAEFIK_URL)
+    log.info("  Authentik:    %s", AUTHENTIK_URL)
+    log.info("  Outpost:      %s", AUTHENTIK_OUTPOST)
+    log.info("  Middleware:   %s", AUTHENTIK_MIDDLEWARE)
+    log.info("  Interval:     %ds", POLL_INTERVAL)
+    log.info("  Docker:       %s", DOCKER_URL or "disabled")
+    log.info("  Label key:    %s", LABEL_KEY)
+    log.info("  Stale action: %s%s", STALE_ACTION,
+             f" (threshold: {STALE_THRESHOLD_DAYS}d)" if STALE_ACTION == "remove" else "")
 
     if GROUP_MODE == "hierarchical":
-        log.info("  Group mode: hierarchical — label minimum tier, higher tiers auto-included")
+        log.info("  Group mode:   hierarchical — label minimum tier, higher tiers auto-included")
         if _TIER_ORDER:
-            log.info("  Tier order: %s", " → ".join(_TIER_ORDER))
+            log.info("  Tier order:   %s", " → ".join(_TIER_ORDER))
     else:
-        log.warning("  Group mode: flat — FOR AUTHENTIK PROS ONLY. Higher tiers NOT auto-included.")
-        log.warning("  You are responsible for listing every group in every label. No safety net.")
+        log.warning("  Group mode:   flat — FOR AUTHENTIK PROS ONLY. Higher tiers NOT auto-included.")
 
     log.info("Resolving flows and outpost on startup...")
     auth_flow  = ak.get_flow_uuid(AUTH_FLOW_SLUG)
@@ -170,12 +175,12 @@ def run() -> None:
             ak.find_or_create_group(name)
             log.info("  Group ready: %r", name)
 
-    provisioned = _load_state()
-    log.info("Loaded %d previously provisioned host(s)", len(provisioned))
+    provisioned, stale_since = _load_state()
+    log.info("Loaded %d provisioned host(s), %d stale", len(provisioned), len(stale_since))
 
     while True:
         try:
-            _poll(traefik, ak, docker, auth_flow, inval_flow, provisioned)
+            _poll(traefik, ak, docker, auth_flow, inval_flow, provisioned, stale_since)
         except Exception as exc:
             log.error("Poll cycle failed: %s", exc)
 
@@ -189,13 +194,21 @@ def _poll(
     auth_flow: str,
     inval_flow: str,
     provisioned: set,
+    stale_since: dict,
 ) -> None:
     host_groups: dict[str, str] = docker.get_host_access_groups(LABEL_KEY) if docker else {}
 
-    hosts = traefik.get_protected_hosts(AUTHENTIK_MIDDLEWARE)
-    new   = [e for e in hosts if e["host"] not in provisioned]
+    hosts   = traefik.get_protected_hosts(AUTHENTIK_MIDDLEWARE)
+    active  = {e["host"] for e in hosts}
+    new     = [e for e in hosts if e["host"] not in provisioned]
+
     log.info("Poll: %d protected router(s), %d new", len(hosts), len(new))
 
+    # ── stale detection ───────────────────────────────────────────────────────
+    _check_stale(ak, provisioned, active, stale_since)
+    _save_state(provisioned, stale_since)
+
+    # ── provision new hosts ───────────────────────────────────────────────────
     if not new:
         return
 
@@ -258,9 +271,103 @@ def _poll(
         else:
             log.info("  No access-group label — open to all authenticated users")
 
+        # Clear any stale marker if this host was previously flagged
+        stale_since.pop(host, None)
         provisioned.add(host)
-        _save_state(provisioned)
+        _save_state(provisioned, stale_since)
         log.info("  Done: %s", host)
+
+
+def _check_stale(
+    ak: AuthentikClient,
+    provisioned: set,
+    active_hosts: set,
+    stale_since: dict,
+) -> None:
+    """Detect stale apps and act according to STALE_ACTION."""
+    now = datetime.now(timezone.utc)
+
+    for host in list(provisioned):
+        if host in active_hosts:
+            if host in stale_since:
+                del stale_since[host]
+                log.info("Host %s is active again — stale marker cleared", host)
+            continue
+
+        # Host is absent from Traefik
+        if host not in stale_since:
+            stale_since[host] = now.isoformat()
+            log.warning("Stale: %s disappeared from Traefik", host)
+
+        absent_since = datetime.fromisoformat(stale_since[host])
+        days_absent  = (now - absent_since).days
+
+        if STALE_ACTION == "remove" and days_absent >= STALE_THRESHOLD_DAYS:
+            log.warning("Stale: %s absent %dd — removing from Authentik", host, days_absent)
+            _remove_stale_app(ak, host, provisioned, stale_since)
+        elif STALE_ACTION == "remove":
+            days_left = STALE_THRESHOLD_DAYS - days_absent
+            log.warning(
+                "Stale: %s absent %dd — auto-remove in %dd "
+                "(Authentik UI → Applications → %s → Delete to remove now)",
+                host, days_absent, days_left, _slug(host.split(".")[0]),
+            )
+        else:
+            log.warning(
+                "Stale: %s absent %dd — remove manually: "
+                "Authentik UI → Applications → %s → Delete",
+                host, days_absent, _slug(host.split(".")[0]),
+            )
+            log.warning(
+                "  Set STALE_ACTION=remove + STALE_THRESHOLD_DAYS=%d to auto-remove",
+                STALE_THRESHOLD_DAYS,
+            )
+
+
+def _remove_stale_app(
+    ak: AuthentikClient,
+    host: str,
+    provisioned: set,
+    stale_since: dict,
+) -> None:
+    """Delete the Authentik Application, Provider, and outpost membership for a stale host."""
+    subdomain = host.split(".")[0]
+    app_slug  = _slug(subdomain)
+
+    try:
+        app = ak.get_application(app_slug)
+        if app is None:
+            log.info("  Application %s not found in Authentik — already gone", app_slug)
+        else:
+            provider_pk = app.get("provider")
+
+            # Remove from outpost before deleting provider
+            if provider_pk:
+                try:
+                    outpost = ak.get_outpost(AUTHENTIK_OUTPOST)
+                    ak.remove_provider_from_outpost(outpost, provider_pk)
+                    log.info("  Removed provider %d from outpost", provider_pk)
+                except Exception as exc:
+                    log.warning("  Could not update outpost: %s", exc)
+
+            # Delete application — policy bindings cascade-delete automatically
+            ak.delete_application(app_slug)
+            log.info("  Deleted application %s", app_slug)
+
+            # Delete provider (not cascade-deleted with application)
+            if provider_pk:
+                try:
+                    ak.delete_provider(provider_pk)
+                    log.info("  Deleted provider pk=%d", provider_pk)
+                except Exception as exc:
+                    log.warning("  Could not delete provider: %s", exc)
+
+        provisioned.discard(host)
+        stale_since.pop(host, None)
+        log.info("  Stale app %s fully removed", host)
+
+    except Exception as exc:
+        log.error("  Failed to remove stale app %s: %s", host, exc)
 
 
 if __name__ == "__main__":

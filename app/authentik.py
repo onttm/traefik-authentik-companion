@@ -1,5 +1,5 @@
-"""Authentik API client — provisions proxy providers, applications, outpost membership,
-groups, and application access policy bindings."""
+"""Authentik API client — provisions and optionally cleans up proxy providers,
+applications, outpost membership, groups, and application access policy bindings."""
 
 import logging
 import requests
@@ -33,6 +33,10 @@ class AuthentikClient:
         resp.raise_for_status()
         return resp.json()
 
+    def _delete(self, path: str) -> None:
+        resp = self._s.delete(f"{self.url}{path}", timeout=10)
+        resp.raise_for_status()
+
     # ── startup discovery ────────────────────────────────────────────────────
 
     def get_flow_uuid(self, slug: str) -> str:
@@ -61,7 +65,7 @@ class AuthentikClient:
         log.info("Created group %r (pk=%s)", name, result["pk"][:8])
         return result["pk"]
 
-    # ── per-host provisioning ────────────────────────────────────────────────
+    # ── provider management ──────────────────────────────────────────────────
 
     def find_provider(self, external_host: str) -> int | None:
         """Return pk of an existing proxy provider for external_host, or None."""
@@ -89,12 +93,25 @@ class AuthentikClient:
         })
         return result["pk"]
 
+    def delete_provider(self, provider_pk: int) -> None:
+        self._delete(f"/api/v3/providers/proxy/{provider_pk}/")
+
+    # ── application management ───────────────────────────────────────────────
+
     def find_application(self, slug: str) -> str | None:
         """Return the UUID of an existing application by slug, or None."""
         data = self._get("/api/v3/core/applications/", {"search": slug})
         for a in data.get("results", []):
             if a.get("slug") == slug:
                 return a["pk"]
+        return None
+
+    def get_application(self, slug: str) -> dict | None:
+        """Return the full application object by slug, or None."""
+        data = self._get("/api/v3/core/applications/", {"search": slug})
+        for a in data.get("results", []):
+            if a.get("slug") == slug:
+                return a
         return None
 
     def create_application(
@@ -110,6 +127,12 @@ class AuthentikClient:
         })
         return result["pk"]
 
+    def delete_application(self, slug: str) -> None:
+        """Delete an application by slug. Policy bindings cascade-delete automatically."""
+        self._delete(f"/api/v3/core/applications/{slug}/")
+
+    # ── outpost management ───────────────────────────────────────────────────
+
     def add_provider_to_outpost(self, outpost: dict, provider_pk: int) -> None:
         current = list(outpost.get("providers") or [])
         if provider_pk in current:
@@ -118,6 +141,16 @@ class AuthentikClient:
             "name": outpost["name"],
             "type": outpost["type"],
             "providers": current + [provider_pk],
+        })
+
+    def remove_provider_from_outpost(self, outpost: dict, provider_pk: int) -> None:
+        current = list(outpost.get("providers") or [])
+        if provider_pk not in current:
+            return
+        self._patch(f"/api/v3/outposts/instances/{outpost['pk']}/", {
+            "name": outpost["name"],
+            "type": outpost["type"],
+            "providers": [p for p in current if p != provider_pk],
         })
 
     # ── access policy bindings ───────────────────────────────────────────────
