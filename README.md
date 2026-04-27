@@ -88,10 +88,17 @@ API token is required.** Anyone with `docker exec` access to the host can run it
 
 ### Step 1 — Create the service account and token
 
+> [!NOTE]
+> Authentik 2025.10+ enforces permissions through its RBAC system (group → role → permissions).
+> Direct `user_permissions` are not checked by the API. The script below creates the required
+> RBAC group and role automatically.
+
 ```bash
 docker exec authentik ak shell -c "
-from authentik.core.models import User, UserTypes, Token, TokenIntents
-from django.contrib.auth.models import Permission
+from authentik.core.models import User, UserTypes, Token, TokenIntents, Group as AKGroup
+from authentik.rbac.models import Role
+from django.contrib.auth.models import Group as DjangoGroup, Permission
+from django.db.models import Q
 
 # Create a non-superuser service account (cannot log in via UI)
 user = User(
@@ -103,28 +110,42 @@ user = User(
 user.set_unusable_password()
 user.save()
 
-# Grant minimum required permissions — nothing more
-for app_label, codename in [
+# Create RBAC group and role — required for Authentik API permission enforcement
+ak_group, _ = AKGroup.objects.get_or_create(name='authentik-companion')
+role, _ = Role.objects.get_or_create(name='authentik-companion')
+
+# Role requires a backing Django auth.Group
+if role.group is None:
+    dj_group, _ = DjangoGroup.objects.get_or_create(name='ak-role-authentik-companion')
+    role.group = dj_group
+    role.save()
+
+# Assign minimum required permissions
+perms_spec = [
     ('authentik_flows',           'view_flow'),
     ('authentik_outposts',        'view_outpost'),
     ('authentik_outposts',        'change_outpost'),
     ('authentik_providers_proxy', 'add_proxyprovider'),
     ('authentik_providers_proxy', 'view_proxyprovider'),
-    ('authentik_providers_proxy', 'delete_proxyprovider'),  # required for STALE_ACTION=remove
+    ('authentik_providers_proxy', 'delete_proxyprovider'),
     ('authentik_core',            'add_application'),
     ('authentik_core',            'view_application'),
-    ('authentik_core',            'delete_application'),    # required for STALE_ACTION=remove
+    ('authentik_core',            'delete_application'),
     ('authentik_core',            'add_group'),
     ('authentik_core',            'view_group'),
     ('authentik_policies',        'add_policybinding'),
     ('authentik_policies',        'view_policybinding'),
-]:
-    try:
-        user.user_permissions.add(
-            Permission.objects.get(content_type__app_label=app_label, codename=codename)
-        )
-    except Permission.DoesNotExist:
-        print('WARNING: permission not found:', app_label + '.' + codename)
+]
+q = Q()
+for app_label, codename in perms_spec:
+    q |= Q(content_type__app_label=app_label, codename=codename)
+perms = Permission.objects.filter(q)
+missing = set(f'{a}.{c}' for a,c in perms_spec) - set(f'{p.content_type.app_label}.{p.codename}' for p in perms)
+if missing:
+    print('WARNING: permissions not found:', missing)
+role.assign_perms(list(perms))
+ak_group.roles.add(role)
+user.ak_groups.add(ak_group)
 
 # Issue a non-expiring API token
 token = Token.objects.create(
@@ -173,20 +194,20 @@ print('deleted')
 
 ### Existing install: enable STALE_ACTION=remove
 
-If you installed before v4 and want to switch to `STALE_ACTION=remove`, grant the two additional delete permissions with one `ak shell` command, then restart the companion:
+If you installed before v4 and want to switch to `STALE_ACTION=remove`, grant the two additional delete permissions via the RBAC role, then restart the companion:
 
 ```bash
 docker exec authentik ak shell -c "
-from authentik.core.models import User
+from authentik.rbac.models import Role
 from django.contrib.auth.models import Permission
-user = User.objects.get(username='authentik-companion')
-for app_label, codename in [
-    ('authentik_core',            'delete_application'),
-    ('authentik_providers_proxy', 'delete_proxyprovider'),
-]:
-    user.user_permissions.add(
-        Permission.objects.get(content_type__app_label=app_label, codename=codename)
-    )
+from django.db.models import Q
+
+role = Role.objects.get(name='authentik-companion')
+perms = Permission.objects.filter(
+    Q(content_type__app_label='authentik_core',            codename='delete_application') |
+    Q(content_type__app_label='authentik_providers_proxy', codename='delete_proxyprovider')
+)
+role.assign_perms(list(perms))
 print('done')
 " 2>&1 | tail -1
 ```
@@ -270,11 +291,25 @@ and setting `authentik.access.group` has made an explicit access control choice.
 companion executes that decision; it does not make it. This is the same trust model as
 cf-companion — the human writes the Traefik rule, the tool acts on it.
 
-**Concern 3 — Socket-proxy topology exposure: partially mitigated**
+**Concern 3 — Socket-proxy topology exposure: mitigated**
 
-The companion reads only `GET /containers/json` via socket-proxy. Exposure is bounded
-by whatever the shared socket-proxy allowlist permits. Pending action: audit the
-socket-proxy allowlist and confirm `CONTAINERS=1` read access is the only path granted.
+The companion reads only `GET /containers/json` via socket-proxy. Socket-proxy allowlist
+audited against the companion's actual Docker API usage:
+
+| Permission | Required by companion | Notes |
+|---|---|---|
+| `CONTAINERS=1` | ✓ yes | `GET /containers/json` — read container labels |
+| `ALLOW_START/STOP/RESTARTS` | ✗ no | Portainer only |
+| `POST=1` | ✗ no | Portainer only — companion never POSTs to containers |
+| `IMAGES/NETWORKS/SERVICES/TASKS/VOLUMES` | ✗ no | Portainer only |
+| `SECRETS=0` | blocked | companion reads its token via `/run/secrets/` container mount, not Docker API |
+| `AUTH=0` | blocked | correctly disabled |
+| `EXEC=0` | blocked | correctly disabled |
+
+The companion shares the `socket_proxy` network with Portainer so it technically has
+*access* to the broader permission set. This is a code-trust boundary: the companion's
+code only ever calls `GET /containers/json`. Since you control the image build, this is
+acceptable for a homelab deployment.
 
 **Concern 4 — Stale apps: accepted, documented**
 
@@ -297,7 +332,7 @@ self-limiting.
 |---|---|---|
 | Token blast radius | Full Authentik admin access | 11 scoped permissions, no user management |
 | Human review | Same | Same — label is the human decision |
-| Stack topology | Bounded by socket-proxy | Bounded by socket-proxy (audit pending) |
+| Stack topology | Bounded by socket-proxy | Audited — only `CONTAINERS=1` read needed; all write paths blocked |
 | Stale apps | Accumulates | flag/remove modes with grace period — see stale app docs |
 | Label trust | Self-limiting | Self-limiting — no change needed |
 

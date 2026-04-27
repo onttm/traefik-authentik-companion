@@ -266,7 +266,8 @@ def _poll(
 
         # ── provider ──────────────────────────────────────────────────────────
         provider_pk = ak.find_provider(external_url)
-        if provider_pk is None:
+        provider_is_new = provider_pk is None
+        if provider_is_new:
             provider_pk = ak.create_provider(
                 name=f"{app_name} Proxy Provider",
                 external_host=external_url,
@@ -277,6 +278,11 @@ def _poll(
             log.info("  Created provider pk=%d", provider_pk)
         else:
             log.info("  Provider pk=%d already exists", provider_pk)
+            # Pre-existing provider may be linked to an app whose slug differs
+            # from what we'd derive from the hostname (e.g. qbit vs qbittorrent).
+            linked_slug = ak.get_provider_application_slug(provider_pk)
+            if linked_slug:
+                app_slug = linked_slug
 
         # ── application ───────────────────────────────────────────────────────
         app_uuid = ak.find_application(app_slug)

@@ -13,7 +13,8 @@ _HOST_RULE_RE = re.compile(r'Host\(`([^`]+)`\)')
 
 class DockerClient:
     def __init__(self, url: str):
-        self.url = url.rstrip("/")
+        # requests doesn't support tcp:// — Docker socket-proxies speak plain HTTP
+        self.url = url.rstrip("/").replace("tcp://", "http://", 1)
 
     def get_host_access_groups(self, label_key: str) -> dict[str, str]:
         """Return {host: group_csv} by scanning running container labels.

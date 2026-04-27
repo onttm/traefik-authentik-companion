@@ -25,16 +25,22 @@ class AuthentikClient:
 
     def _post(self, path: str, data: dict) -> dict:
         resp = self._s.post(f"{self.url}{path}", json=data, timeout=10)
+        if not resp.ok:
+            log.error("POST %s → %d: %s", path, resp.status_code, resp.text[:500])
         resp.raise_for_status()
         return resp.json()
 
     def _patch(self, path: str, data: dict) -> dict:
         resp = self._s.patch(f"{self.url}{path}", json=data, timeout=10)
+        if not resp.ok:
+            log.error("PATCH %s → %d: %s", path, resp.status_code, resp.text[:500])
         resp.raise_for_status()
         return resp.json()
 
     def _delete(self, path: str) -> None:
         resp = self._s.delete(f"{self.url}{path}", timeout=10)
+        if not resp.ok and resp.status_code != 404:
+            log.error("DELETE %s → %d: %s", path, resp.status_code, resp.text[:500])
         resp.raise_for_status()
 
     # ── permission probing ───────────────────────────────────────────────────
@@ -82,8 +88,17 @@ class AuthentikClient:
 
     # ── provider management ──────────────────────────────────────────────────
 
+    def get_provider_application_slug(self, provider_pk: int) -> str | None:
+        """Return the slug of the application already linked to this provider, or None."""
+        resp = self._s.get(f"{self.url}/api/v3/providers/proxy/{provider_pk}/", timeout=10)
+        if resp.status_code == 404:
+            return None
+        resp.raise_for_status()
+        return resp.json().get("assigned_application_slug")
+
     def find_provider(self, external_host: str) -> int | None:
-        data = self._get("/api/v3/providers/proxy/", {"search": external_host})
+        # Authentik's ?search= matches names, not URLs — fetch all and filter client-side.
+        data = self._get("/api/v3/providers/proxy/", {"page_size": 500})
         for p in data.get("results", []):
             if p.get("external_host") == external_host:
                 return p["pk"]
@@ -113,18 +128,19 @@ class AuthentikClient:
     # ── application management ───────────────────────────────────────────────
 
     def find_application(self, slug: str) -> str | None:
-        data = self._get("/api/v3/core/applications/", {"search": slug})
-        for a in data.get("results", []):
-            if a.get("slug") == slug:
-                return a["pk"]
-        return None
+        # Authentik guardian filters the list endpoint — use direct slug retrieve instead.
+        resp = self._s.get(f"{self.url}/api/v3/core/applications/{slug}/", timeout=10)
+        if resp.status_code == 404:
+            return None
+        resp.raise_for_status()
+        return resp.json()["pk"]
 
     def get_application(self, slug: str) -> dict | None:
-        data = self._get("/api/v3/core/applications/", {"search": slug})
-        for a in data.get("results", []):
-            if a.get("slug") == slug:
-                return a
-        return None
+        resp = self._s.get(f"{self.url}/api/v3/core/applications/{slug}/", timeout=10)
+        if resp.status_code == 404:
+            return None
+        resp.raise_for_status()
+        return resp.json()
 
     def create_application(
         self, name: str, slug: str, provider_pk: int, launch_url: str
