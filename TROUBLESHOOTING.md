@@ -1,6 +1,6 @@
 # Troubleshooting & Debugging Reference
 
-Accumulated from the first production deployment on Authentik 2025.12.1. Covers every
+Accumulated from the first production deployment on Authentik 2026.2.2. Covers every
 non-obvious failure mode hit during initial bring-up. If something breaks, start here.
 
 ---
@@ -278,9 +278,9 @@ After running this, restart the embedded outpost container (or restart Authentik
 
 ---
 
-## Authentik 2025.x permission system notes
+## Authentik 2026.x permission system notes
 
-These findings apply to Authentik 2025.10–2025.12.1. May change in later versions.
+These findings apply to Authentik 2026.2.2. May change in later versions.
 
 | API endpoint | Guardian-filtered? | Notes |
 |---|---|---|
