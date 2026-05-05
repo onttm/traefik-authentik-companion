@@ -68,11 +68,31 @@ Binds only what you explicitly list. No inference, no safety net. If you label a
 | `AUTHENTIK_GROUP_ADMIN` | — | Name of your admin tier group |
 | `AUTHENTIK_LABEL_KEY` | `authentik.access.group` | Docker label key to read |
 | `DOCKER_URL` | — | Socket-proxy URL for label reading, e.g. `tcp://socket-proxy:2375` |
-| `AUTHENTIK_AUTH_FLOW` | `default-authentication-flow` | Auth flow slug |
-| `AUTHENTIK_INVALIDATION_FLOW` | `default-provider-invalidation-flow` | Invalidation flow slug |
+| `AUTHENTIK_AUTH_FLOW` | `default-authentication-flow` | **Authentication** flow slug — runs when the user is not logged in (login page, Plex SSO, etc.) |
+| `AUTHENTIK_AUTHZ_FLOW` | `default-provider-authorization-implicit-consent` | **Authorization** flow slug — runs after login to grant access to an application (consent). Must be an implicit-consent flow, NOT the authentication flow. |
+| `AUTHENTIK_INVALIDATION_FLOW` | `default-provider-invalidation-flow` | Invalidation flow slug — runs on logout |
 | `POLL_INTERVAL` | `60` | Seconds between Traefik polls |
 | `LOG_LEVEL` | `INFO` | Python log level |
 | `STATE_FILE` | `/data/provisioned.json` | Persistent state path |
+| `STALE_ACTION` | `flag` | What to do with provisioned hosts that disappear from Traefik: `flag` (log warning only) or `remove` (auto-delete after threshold) |
+| `STALE_THRESHOLD_DAYS` | `30` | Days a host must be absent before auto-removal (only used when `STALE_ACTION=remove`) |
+
+### Authentication flow vs. authorization flow
+
+These are two distinct Authentik flow types that serve different purposes:
+
+**`AUTHENTIK_AUTH_FLOW`** (authentication flow) — runs when a user is **not yet logged in**. Handles credential collection: username/password form, Plex SSO, MFA, etc. The Authentik login page is rendered by this flow. Default: `default-authentication-flow`.
+
+**`AUTHENTIK_AUTHZ_FLOW`** (authorization flow) — runs when a user **is already logged in** and requests access to an application for the first time. Handles consent: "do you allow this app to see your profile?" In a homelab the implicit-consent flow skips the prompt and grants access automatically. Default: `default-provider-authorization-implicit-consent`.
+
+> [!CAUTION]
+> Setting `AUTHENTIK_AUTHZ_FLOW` to an authentication flow (the login flow) is a silent misconfiguration that causes every already-authenticated user to be sent back through the login flow on every access. Symptoms: users who completed login are immediately redirected back to the login page; Plex-federated users who have no local password hit a `404 /if/flow/.../undefined` loop. The companion logs both UUIDs on startup — verify that `auth_flow` and `authz_flow` resolve to different flows.
+
+On startup the companion logs both resolved UUIDs so you can verify:
+```
+auth_flow=32ea77bc  authz_flow=ec63c754  invalidation_flow=f7bae89b
+```
+If `auth_flow` and `authz_flow` are the same UUID, `AUTHENTIK_AUTHZ_FLOW` is misconfigured.
 
 ## Service account and API token setup
 

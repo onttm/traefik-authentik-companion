@@ -233,6 +233,51 @@ permission. If you see this, the RBAC role is missing `delete_application` or
 
 ---
 
+### authorization_flow set to login flow — authenticated users looped back to login
+
+**Symptom:** Users complete login successfully but are immediately redirected back to the Authentik login page on every access. Plex-federated users (no local password) hit a `404` loop at `/if/flow/default-authentication-flow/undefined`. Local users (akadmin) appear to work because they can complete the password stage repeatedly, but they are also going through the wrong flow.
+
+**Root cause:** The proxy provider's `authorization_flow` field was set to the authentication flow UUID (`default-authentication-flow`) instead of an implicit-consent flow (`default-provider-authorization-implicit-consent`). These are two different flow types:
+
+- `authentication_flow` — runs when the user is **not logged in** (login page)
+- `authorization_flow` — runs when the user **is already logged in** and requests app access (consent)
+
+Setting both to the same login flow means every access attempt — even from already-authenticated users — triggers the login flow again. The session is valid, so Authentik tries to skip to the end of the login flow, hits an undefined stage, and renders a 404.
+
+**Diagnosis:** Check any proxy provider's authorization flow:
+
+```bash
+docker exec authentik ak shell -c "
+from authentik.providers.proxy.models import ProxyProvider
+from authentik.flows.models import Flow
+consent_slug = 'default-provider-authorization-implicit-consent'
+consent_uuid = Flow.objects.get(slug=consent_slug).pk
+bad = [(p.name, str(p.authorization_flow_id)) for p in ProxyProvider.objects.all()
+       if str(p.authorization_flow_id) != str(consent_uuid)]
+print('Wrong authorization_flow:', len(bad))
+for name, fid in bad:
+    print(' ', name, fid)
+" 2>/dev/null
+```
+
+**Fix:** Bulk-update all providers to the correct authorization flow:
+
+```bash
+docker exec authentik ak shell -c "
+from authentik.providers.proxy.models import ProxyProvider
+from authentik.flows.models import Flow
+consent = Flow.objects.get(slug='default-provider-authorization-implicit-consent')
+updated = ProxyProvider.objects.all().update(authorization_flow=consent)
+print('Updated', updated, 'providers')
+" 2>/dev/null
+```
+
+After running this, restart the embedded outpost container (or restart Authentik) so it reloads the provider configs. Then delete any active Authentik sessions for affected users so they go through the corrected flow on next access.
+
+**Prevention:** This bug was in the companion's `create_provider()` call — it passed the auth flow UUID for both `authentication_flow` and `authorization_flow`. The fix resolves both flow slugs independently at startup (`AUTHENTIK_AUTH_FLOW` and `AUTHENTIK_AUTHZ_FLOW`) and passes them separately. Verify on startup that the two logged UUIDs differ.
+
+---
+
 ## Authentik 2025.x permission system notes
 
 These findings apply to Authentik 2025.10–2025.12.1. May change in later versions.
