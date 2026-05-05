@@ -109,12 +109,14 @@ class AuthentikClient:
         name: str,
         external_host: str,
         auth_flow: str,
+        authz_flow: str,
         invalidation_flow: str,
         cookie_domain: str,
     ) -> int:
         result = self._post("/api/v3/providers/proxy/", {
             "name": name,
-            "authorization_flow": auth_flow,
+            "authentication_flow": auth_flow,
+            "authorization_flow": authz_flow,
             "invalidation_flow": invalidation_flow,
             "external_host": external_host,
             "mode": "forward_single",

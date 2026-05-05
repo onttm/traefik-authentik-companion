@@ -53,6 +53,7 @@ AUTHENTIK_URL        = os.environ["AUTHENTIK_URL"]
 AUTHENTIK_OUTPOST    = os.environ.get("AUTHENTIK_OUTPOST_NAME", "authentik Embedded Outpost")
 AUTHENTIK_MIDDLEWARE = os.environ.get("AUTHENTIK_MIDDLEWARE", "chain-authentik")
 AUTH_FLOW_SLUG       = os.environ.get("AUTHENTIK_AUTH_FLOW", "default-authentication-flow")
+AUTHZ_FLOW_SLUG      = os.environ.get("AUTHENTIK_AUTHZ_FLOW", "default-provider-authorization-implicit-consent")
 INVAL_FLOW_SLUG      = os.environ.get("AUTHENTIK_INVALIDATION_FLOW", "default-provider-invalidation-flow")
 POLL_INTERVAL        = int(os.environ.get("POLL_INTERVAL", "60"))
 STATE_FILE           = Path(os.environ.get("STATE_FILE", "/data/provisioned.json"))
@@ -198,17 +199,19 @@ def run() -> None:
         log.warning("  Group mode:   flat — FOR AUTHENTIK PROS ONLY. Higher tiers NOT auto-included.")
 
     log.info("Resolving flows and outpost on startup...")
-    auth_flow = inval_flow = None
+    auth_flow = authz_flow = inval_flow = None
     wait = 10
     while auth_flow is None:
         try:
             auth_flow  = ak.get_flow_uuid(AUTH_FLOW_SLUG)
+            authz_flow = ak.get_flow_uuid(AUTHZ_FLOW_SLUG)
             inval_flow = ak.get_flow_uuid(INVAL_FLOW_SLUG)
         except Exception as exc:
             log.warning("Authentik not ready (%s) — retrying in %ds...", exc, wait)
             time.sleep(wait)
             wait = min(wait * 2, 60)
-    log.info("  auth_flow=%s  invalidation_flow=%s", auth_flow[:8], inval_flow[:8])
+    log.info("  auth_flow=%s  authz_flow=%s  invalidation_flow=%s",
+             auth_flow[:8], authz_flow[:8], inval_flow[:8])
 
     if STALE_ACTION == "remove":
         _check_remove_permissions(ak)
@@ -224,7 +227,7 @@ def run() -> None:
 
     while True:
         try:
-            _poll(traefik, ak, docker, auth_flow, inval_flow, provisioned, stale_since)
+            _poll(traefik, ak, docker, auth_flow, authz_flow, inval_flow, provisioned, stale_since)
         except Exception as exc:
             log.error("Poll cycle failed: %s", exc)
 
@@ -236,6 +239,7 @@ def _poll(
     ak: AuthentikClient,
     docker: DockerClient | None,
     auth_flow: str,
+    authz_flow: str,
     inval_flow: str,
     provisioned: set,
     stale_since: dict,
@@ -280,6 +284,7 @@ def _poll(
                 name=f"{app_name} Proxy Provider",
                 external_host=external_url,
                 auth_flow=auth_flow,
+                authz_flow=authz_flow,
                 invalidation_flow=inval_flow,
                 cookie_domain=domain,
             )
